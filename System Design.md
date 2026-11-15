@@ -7,6 +7,8 @@
 > **Numbers** are the video's assumptions. In an interview, always state and confirm your own.
 >
 > **How to use:** First 2-3 times, read Parts 1-5 fully and redraw each system from memory. After that, use only [Part 10: Cheat Sheet](#part-10-cheat-sheet).
+>
+> **Diagrams:** flows are drawn with Mermaid (renders automatically on GitHub) and ASCII. If a Mermaid block shows as plain code in your viewer, paste it into https://mermaid.live.
 
 ## Video map
 
@@ -96,6 +98,15 @@ A repeatable structure for any whiteboard system design interview. **60 minutes 
 | 5 | **Wrap-up: trade-offs and extensions** | last few min |
 
 Steps 2 and 3 are interchangeable: start with data/API if modeling entities first helps you, or start with high-level design if imagining the user flow first helps. The speaker usually starts with high-level design. Do not spend more than 15-20 min on either.
+
+```mermaid
+flowchart LR
+    A["1. Clarify requirements<br/>5-10 min"] --> B["2. Data model + API<br/>15-20 min"]
+    B <--> C["3. High-level design<br/>~15 min"]
+    C --> D["4. Bottlenecks, scale, reliability<br/>5-10 min"]
+    D --> E["5. Trade-offs + extensions<br/>last few min"]
+    A -. "check in: does this scope make sense?" .-> B
+```
 
 > **➕ Added (mnemonic):** Clarify, Data/API, High-level, Scale, Trade-offs. Say "outline" at the start: *"I'll clarify requirements, model data and APIs, sketch the architecture, then discuss scale, failures, and trade-offs."*
 
@@ -243,6 +254,29 @@ This is where you show what breaks under heavy load, not only the happy path. It
 
 ### Read workflow: play a song `[31:16]`
 
+```mermaid
+sequenceDiagram
+    participant App as Mobile app
+    participant LB as Load balancer
+    participant API as API server
+    participant DB as SQL DB
+    participant S3 as Blob storage
+    App->>LB: GET /songs/:id with JWT
+    LB->>API: route request
+    API->>API: validate JWT
+    alt JWT invalid
+        API-->>App: authentication error
+    else JWT valid
+        API->>DB: query song metadata
+        DB-->>API: title, duration, file_url
+        API->>API: generate signed URL (expires)
+        API-->>App: metadata + signed URL
+        App->>S3: range requests for audio chunks (signed URL)
+        S3-->>App: stream audio chunks
+        App->>API: POST /songs/:id/play (analytics)
+    end
+```
+
 1. User taps play -> `GET /songs/{id}` -> load balancer -> API server.
 2. API validates **JWT**. If invalid, return an **authentication error** and stop.
 3. Query **song metadata** from SQL.
@@ -252,6 +286,26 @@ This is where you show what breaks under heavy load, not only the happy path. It
 7. Analytics: separate `POST /songs/{id}/play` with metadata to store for later.
 
 ### Write workflow: artist uploads `[33:03]`
+
+```mermaid
+sequenceDiagram
+    participant Artist as Artist app
+    participant API as API server
+    participant S3 as Blob storage
+    participant DB as SQL DB
+    participant CDN as CDN
+    Artist->>API: POST song + metadata (via load balancer)
+    API->>API: validate format and size
+    alt invalid
+        API-->>Artist: rejected (unsupported format or size)
+    else valid
+        API->>S3: store audio at artist/ID/album/ID/song
+        API->>API: extract duration, bitrate + body fields
+        API->>DB: insert song metadata
+        API->>CDN: invalidate stale cached pages
+        API-->>Artist: upload successful
+    end
+```
 
 1. App `POST`s song + metadata -> load balancer -> API server.
 2. Validate **file format and size** (limits). If invalid, reject (unsupported format/size).
@@ -299,6 +353,51 @@ artists        (id PK, name, country, ...)
 artist_songs   (artist_id, song_id)                            -- join table
 ```
 
+```mermaid
+erDiagram
+    USERS ||--o{ PLAYLISTS : owns
+    PLAYLISTS ||--o{ PLAYLIST_ITEMS : contains
+    SONGS ||--o{ PLAYLIST_ITEMS : appears_in
+    ARTISTS ||--o{ ARTIST_SONGS : creates
+    SONGS ||--o{ ARTIST_SONGS : credited_in
+    USERS {
+        int id PK
+        string email
+        string password_hash
+        datetime created_at
+        datetime last_login
+        string subscription_type
+        string country
+    }
+    PLAYLISTS {
+        int id PK
+        int owner_id FK
+        string name
+        datetime created_at
+    }
+    PLAYLIST_ITEMS {
+        int playlist_id FK
+        int song_id FK
+        int position
+        datetime added_at
+    }
+    SONGS {
+        int id PK
+        string title
+        int duration
+        string file_url
+    }
+    ARTISTS {
+        int id PK
+        string name
+        string country
+    }
+    ARTIST_SONGS {
+        int artist_id FK
+        int song_id FK
+    }
+```
+
 **Why SQL:** lots of **joins** (playlists-songs, songs-artists) and complex queries like "find all songs by artists a user follows".
 
 **Indexes:** `songs.title`, `artists.name`, join-table `song_id`, `playlist_items` index (fast "songs in playlist" and "playlists containing song").
@@ -315,6 +414,22 @@ artist_songs   (artist_id, song_id)                            -- join table
 | User metadata | 50M x 1 KB | **50 GB** |
 | Audio | 200M x 3 MB | **600 TB** (x2-3 for replicas/versions) |
 
+```mermaid
+flowchart TB
+    U["Users worldwide"] --> CDN["CDN edges per region<br/>NA / EU / SA (LRU)"]
+    U --> LB1["Load balancer, region 1"]
+    U --> LB2["Load balancer, region 2"]
+    CDN -. "cache miss" .-> BLOB["Regional blob storage<br/>(signed URLs)"]
+    LB1 --> API["Stateless API servers<br/>(scale by adding replicas)"]
+    LB2 --> API
+    API -- "writes" --> LEADER[("Leader DB")]
+    API -- "reads" --> F1[("Follower 1")]
+    API -- "reads" --> F2[("Follower 2")]
+    LEADER -. "replication" .-> F1
+    LEADER -. "replication" .-> F2
+    LEADER --- SH["Shards: US / EU<br/>songs partitioned by artist ID range"]
+```
+
 **Steps:**
 1. **CDN edges per region** (North America, Europe, South America...). Use **LRU** eviction; on a cache miss, fetch from origin storage.
 2. **Load balancers in multiple regions** (at least two) mapping requests to API servers.
@@ -325,6 +440,23 @@ artist_songs   (artist_id, song_id)                            -- join table
 7. **Start simple.** Do not over-engineer for few users; scale gradually.
 
 ## 3.7 The senior vs mid-level pyramid `[48:51]`
+
+```
+                 /\
+                /  \         3. CODING
+               /    \           smallest part, least brainpower,
+              /------\          AI does it faster and cheaper
+             /        \
+            /   TECH   \     2. TECH SELECTION
+           / SELECTION  \       SQL vs NoSQL, caching, eviction,
+          /--------------\      storage solutions
+         /                \
+        /     PLANNING     \  1. PLANNING / BLUEPRINTING
+       /    (blueprinting)  \    requirements, capacity, architecture
+      /______________________\   <- start here (most important)
+
+ Mid-level devs often flip it upside down: start coding with no plan.
+```
 
 - **Bottom (largest, most important): Planning/blueprinting.** Requirements, capacity estimation, architecture.
 - **Middle: Tech selection.** SQL vs NoSQL (and which one), caching layers, eviction policy, storage.
@@ -381,6 +513,20 @@ Video plan: requirements and estimation -> high-level design (API, schema, flows
 ## 4.2 Capacity estimation `[58:39]`
 
 Think of a **funnel**: all visitors (100%) -> ~10% browse/search -> ~10% of those actually book. Most visitors are tire-kickers but they still add **QPS**.
+
+```
+ +------------------------------------------+
+ |  Visitors viewing hotels   100%          |  -> ~1,000 QPS (reads)
+ +--------------------+---------------------+
+                      |  ~10% browse / search
+              +-------v--------+
+              |   Searchers    |
+              +-------+--------+
+                      |  ~10% book
+                 +----v-----+
+                 | Bookings |   -> ~17 TPS (writes)
+                 +----------+
+```
 
 Two ways to estimate. Get **one** anchor number from the interviewer, then compute the rest:
 - **Top-down:** monthly visits (e.g., ~500M/month from a traffic tool).
@@ -444,6 +590,28 @@ Two ways to estimate. Get **one** anchor number from the interviewer, then compu
 - **Search service + Elasticsearch:** PostgreSQL can't handle ~1,000 QPS of search well. ES filters by location (e.g., within 5 km), price range, ratings, and does full-text on names/descriptions. **Eventually consistent.**
 - **Message queue (Kafka/RabbitMQ):** when payment succeeds, publish an event -> notifications go out AND availability updates flow to the search service -> ES updates (eventually). Right after payment, search may still show the hotel as available, but **booking is blocked because the booking path double-checks the DB.**
 
+**Booking and eventual consistency (simplified flow):**
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant RS as Reservation service
+    participant DB as PostgreSQL
+    participant P as Payment service
+    participant K as Kafka
+    participant N as Notification service
+    participant ES as Elasticsearch
+    U->>RS: POST /reservations
+    RS->>DB: lock inventory rows, check availability, insert
+    RS->>P: charge payment
+    P-->>RS: payment success
+    RS->>K: publish payment success event
+    RS-->>U: confirmation
+    K->>N: email / push to user and hotel owner
+    K->>ES: update availability (eventually consistent)
+    Note over ES: Briefly stale, may still show the room as available. The booking path re-checks the DB.
+```
+
 **Monolith vs microservices vs pragmatic `[1:09:56]`**
 | Option | Pros | Cons |
 |---|---|---|
@@ -487,6 +655,24 @@ Optional: a **GraphQL layer** in front hides routing between many services from 
 - Enforced with a **unique key** on reservation ID (duplicate-key error -> return existing).
 - Alternative (backend hash of hotel + room + user + date) is more complex and can block legitimate future bookings.
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Reservation service
+    participant DB as SQL DB
+    participant K as Kafka
+    C->>C: generate reservation UUID once
+    C->>R: POST /reservations with reservation_id = UUID
+    R->>DB: does reservation_id already exist?
+    alt not found
+        R->>DB: insert reservation
+        R->>K: publish event (notify user and hotel owner)
+        R-->>C: 201 confirmation
+    else found (double click or retry)
+        R-->>C: return the existing reservation
+    end
+```
+
 > **➕ Added:** This is the **idempotency key** pattern (often sent as an `Idempotency-Key` header). Store key with result, return stored result on retry, expire after ~24h, and pass an idempotency key to the payment provider too.
 
 Scenario 2 (two different users) is solved in [4.6](#46-concurrency-and-race-conditions-13308).
@@ -507,6 +693,68 @@ reservations      (id PK, room_type_id FK, hotel_id FK, guest_id FK,
 guests            (id PK, first_name, last_name, email, ...)
 admins/brokers    (users who publish hotels)
 transactions      (id PK, reservation_id FK, type[new|change|refund], amount +/-)
+```
+
+```mermaid
+erDiagram
+    HOTELS ||--o{ ROOM_TYPES : has
+    ROOM_TYPES ||--o{ ROOM_TYPE_RATES : priced_by
+    ROOM_TYPES ||--o{ ROOMS : has
+    HOTELS ||--o{ ROOM_TYPE_INVENTORY : tracks
+    ROOM_TYPES ||--o{ ROOM_TYPE_INVENTORY : tracks
+    GUESTS ||--o{ RESERVATIONS : makes
+    ROOM_TYPES ||--o{ RESERVATIONS : booked_as
+    HOTELS ||--o{ RESERVATIONS : at
+    RESERVATIONS ||--o{ TRANSACTIONS : has
+    HOTELS {
+        int id PK
+        string name
+        string address
+    }
+    ROOM_TYPES {
+        int id PK
+        int hotel_id FK
+        string name
+        int capacity
+    }
+    ROOM_TYPE_RATES {
+        int room_type_id FK
+        string package
+        decimal rate
+    }
+    ROOMS {
+        int id PK
+        int room_type_id FK
+        int hotel_id FK
+        int floor
+        boolean available
+    }
+    ROOM_TYPE_INVENTORY {
+        int hotel_id FK
+        int room_type_id FK
+        date date
+        int total_inventory
+        int total_reserved
+    }
+    RESERVATIONS {
+        int id PK
+        int room_type_id FK
+        int hotel_id FK
+        int guest_id FK
+        date start_date
+        date end_date
+        string status
+    }
+    TRANSACTIONS {
+        int id PK
+        int reservation_id FK
+        string type
+        decimal amount
+    }
+    GUESTS {
+        int id PK
+        string email
+    }
 ```
 
 **Why a separate `transactions` table?** One reservation can have **multiple transactions**: initial payment, a date change (price difference to pay or refund), or cancellation (negative amount = refund).
@@ -532,6 +780,37 @@ Example: 100 inventory, 92 reserved, booking 1 -> 93 <= 100 OK. With **10% overb
 
 **Scenario 2: two different users, one room left.** PostgreSQL default isolation is **read committed**. There is a **gap between the availability check and the write**. User A reads "1 left", user B also reads "1 left", both checks pass, both book -> **double booking**. So **read committed alone is unsafe for bookings.**
 
+**Without locking (the bug):**
+
+```mermaid
+sequenceDiagram
+    participant A as User A
+    participant B as User B
+    participant DB as Database (read committed)
+    A->>DB: read availability (1 room left)
+    B->>DB: read availability (1 room left)
+    Note over A,B: both checks pass, there is a gap between check and write
+    A->>DB: write booking, reserved + 1
+    B->>DB: write booking, reserved + 1
+    Note over DB: DOUBLE BOOKING
+```
+
+**With row locking (`SELECT ... FOR UPDATE`):**
+
+```mermaid
+sequenceDiagram
+    participant A as User A
+    participant B as User B
+    participant DB as Database
+    A->>DB: BEGIN, SELECT FOR UPDATE (locks the inventory row)
+    B->>DB: BEGIN, SELECT FOR UPDATE (same row, locked)
+    Note over B,DB: B waits its turn (transactions on other rows run in parallel)
+    A->>DB: check ok, reserved + 1, COMMIT (lock released)
+    DB-->>B: lock granted, B now sees the updated row
+    B->>DB: check fails (no room left), ROLLBACK
+    DB-->>B: not available
+```
+
 | Approach | How | Pros | Cons |
 |---|---|---|---|
 | **Serializable isolation** | Set isolation level to serializable when beginning the transaction | Simple; fine at **low TPS** | Transactions block each other at high TPS; **deadlocks** if rows are locked in different orders. Mitigate with lock timeouts and short transactions. |
@@ -550,6 +829,25 @@ Example: 100 inventory, 92 reserved, booking 1 -> 93 <= 100 OK. With **10% overb
 - **Consistent hashing:** hash ring where servers and keys map to points on a circle; each key goes to the **next server clockwise**. Adding a server only moves keys between it and its predecessor (~**1/17** of data).
 - Rule: few shards and rarely changing -> **modulo**; frequently adding shards -> **consistent hashing**.
 
+```
+ MODULO   shard = hash(hotel_id) mod N
+   N = 16  -> shards 0..15
+   add a 17th shard => mod 17 => almost EVERY key maps to a new shard
+   => reshuffle ~all data
+
+ CONSISTENT HASHING (hash ring)
+                 server A
+             .------o------.
+          .'                 '.
+    key1 *                     o server B      each key goes to the
+         |        RING         |               NEXT server clockwise
+    server D o                 * key2
+          '.                 .'
+             '------o------'
+                 server C
+   add a server => only keys between it and its predecessor move (~1/N)
+```
+
 **Caching (Redis / Memcached)**
 - Cache hot inventory.
 - **Key:** `hotel_id + room_type_id + date`. **Value:** total inventory and total reserved. The **overbooking rate** is a fixed config, not stored in cache.
@@ -558,6 +856,21 @@ Example: 100 inventory, 92 reserved, booking 1 -> 93 <= 100 OK. With **10% overb
   1. Search -> check Redis. **Hit:** show immediately.
   2. **Miss or expired:** read from DB, populate Redis, show.
   3. **Booking:** validate against the **DB (source of truth)**, update DB, **invalidate affected cache keys** so the next search is up to date.
+
+**Cache flow:**
+
+```mermaid
+flowchart TD
+    S["User searches hotels"] --> R{"Redis hit<br/>and TTL valid?"}
+    R -- "yes" --> SHOW["Show inventory from cache"]
+    R -- "no (miss or expired)" --> DB[("Read from DB")]
+    DB --> FILL["Populate Redis, TTL ~5 min"]
+    FILL --> SHOW
+    SHOW --> B["User clicks Book"]
+    B --> V["Validate against DB (source of truth)"]
+    V --> U["Update DB with the booking"]
+    U --> INV["Invalidate affected cache keys"]
+```
 
 ## 4.8 Search at scale with Elasticsearch `[1:40:41]`
 
@@ -597,6 +910,23 @@ PostgreSQL (source of truth)
 - **Load balancing:** use **geo/latency-based** routing. Europe users mostly book Europe hotels, US users US hotels.
 - **Regional** Redis caches and **regional** Elasticsearch clusters hold the data most relevant to that region.
 - **Keep one primary shard** (e.g., shard 7 stays a single primary) to **avoid write conflicts between regions**. Since TPS is low, one primary shard + multiple regional replicas is enough.
+
+```mermaid
+flowchart TB
+    US["US users"] --> LBG["Geo / latency load balancer"]
+    EU["EU users"] --> LBG
+    AS["Asia users"] --> LBG
+    LBG --> RUS["US region<br/>read replica + Redis + ES"]
+    LBG --> REU["EU region<br/>read replica + Redis + ES"]
+    LBG --> RAS["Asia region<br/>read replica + Redis + ES"]
+    PRIMARY[("Single primary write DB<br/>no cross-region write conflicts")]
+    PRIMARY -. "async replication" .-> RUS
+    PRIMARY -. "async replication" .-> REU
+    PRIMARY -. "async replication" .-> RAS
+    RUS -- "writes and recent-write reads" --> PRIMARY
+    REU -- "writes and recent-write reads" --> PRIMARY
+    RAS -- "writes and recent-write reads" --> PRIMARY
+```
 
 ## 4.10 Trade-offs to mention
 
@@ -692,6 +1022,17 @@ PostgreSQL (source of truth)
 
 ### Communication method `[2:03:39]`
 
+```
+ POLLING       Client --"new msgs?"--> Server --> "none"     (repeat every N s)
+               Client --"new msgs?"--> Server --> "msg!"     (delay up to N s, wasteful)
+
+ LONG POLLING  Client --"new msgs?"--> Server ...holds... --> msg or timeout
+               Client re-asks (new HTTP request + handshake every time)
+
+ WEBSOCKET     Client ==== handshake once ====> Server
+               Client <=== persistent link, either side pushes anytime ===> Server
+```
+
 | Option | How | Problem |
 |---|---|---|
 | **Polling** | Client periodically asks "any new messages?" | Wastes bandwidth, adds latency (message arrives right after a poll = wait), huge resource waste at millions of users |
@@ -699,6 +1040,20 @@ PostgreSQL (source of truth)
 | **WebSocket (chosen)** | One persistent **bi-directional** connection (HTTP handshake once, then persistent) | Needs **L4** load balancers; more memory per connection. Worth it for real-time |
 
 ### Service discovery `[2:07:40]`
+
+```mermaid
+sequenceDiagram
+    participant CS as Chat servers 1, 2, 3
+    participant REG as Service registry (Consul / Cloud Map)
+    participant LB as Load balancer
+    CS->>REG: register on boot (IP address)
+    loop every ~10 s
+        REG->>CS: health check
+    end
+    LB->>REG: get healthy servers
+    REG-->>LB: servers 1 and 2 (3 is unhealthy)
+    Note over LB: update routing table, send traffic only to 1 and 2
+```
 
 - Chat servers crash, redeploy, scale up/down. The LB needs to know who is healthy.
 - Use a **service registry** (Consul, AWS Cloud Map): servers **register** at boot; **health checks every ~10 s**; the LB **queries healthy servers** and updates its **routing table** (e.g., only servers 1 and 2, drop unhealthy server 3).
@@ -733,6 +1088,34 @@ connections    (Redis)     user_id -> server_id, connection_id, last_active, dev
 
 Example: user A has **3 devices** (phone, tablet, desktop), user B has **2** (phone, laptop).
 
+```mermaid
+flowchart LR
+    subgraph UA["User A devices"]
+        AP["Phone"]
+        AT["Tablet"]
+        AD["Desktop"]
+    end
+    subgraph UB["User B devices"]
+        BP["Phone"]
+        BL["Laptop"]
+    end
+    AP -- "1. send" --> SA["Chat server A"]
+    SA -- "sent ack" --> AP
+    SA -- "sync copy" --> SC["Chat server C"]
+    SC --> AT
+    SA -- "sync copy" --> SD["Chat server D"]
+    SD --> AD
+    SA -- "deliver" --> SB["Chat server B"]
+    SB --> BP
+    SA -- "deliver" --> SE["Chat server E"]
+    SE --> BL
+    BP -- "delivered / read" --> SB
+    SB -- "status update" --> SA
+    SB -- "mark read" --> SE
+```
+
+(Redis tells chat server A which devices of each user are connected to which server.)
+
 1. A's phone sends to **chat server A**, which acks **"sent"**.
 2. Chat server queries **Redis**: B has 2 devices connected to servers B and E; A's other devices are on servers C and D.
 3. Servers C and D **display the sent message** on A's tablet and desktop (sync).
@@ -751,6 +1134,33 @@ Example: user A has **3 devices** (phone, tablet, desktop), user B has **2** (ph
 ## 5.6 Core delivery flows `[2:20:16]`
 
 **Both online**
+
+```mermaid
+sequenceDiagram
+    participant A as User A
+    participant SA as Chat server A
+    participant Q as Message queue
+    participant DB as Cassandra
+    participant R as Redis (connections)
+    participant SB as Chat server B
+    participant B as User B
+    A->>SA: send message (WebSocket)
+    SA->>SA: generate timestamp-based message ID
+    SA-->>A: ack, status SENT
+    SA->>Q: push for persistence
+    Q->>DB: storage consumer writes message
+    SA->>R: where is user B?
+    R-->>SA: B is on chat server B
+    SA->>SB: route via Redis pub/sub
+    SB->>B: deliver in real time (WebSocket)
+    B-->>SB: ack received
+    SB-->>SA: forward delivery ack
+    SA-->>A: status DELIVERED
+    B->>SB: opened message (read receipt)
+    SB-->>SA: read receipt
+    SA-->>A: status READ
+```
+
 1. A sends over WebSocket to chat server A.
 2. Server **generates message ID** (unique, **timestamp-based**), **acks "sent"**.
 3. Pushes message to the **message queue** for persistence.
@@ -761,6 +1171,31 @@ Example: user A has **3 devices** (phone, tablet, desktop), user B has **2** (ph
 8. Queue consumer writes to **Cassandra**.
 
 **Recipient offline**
+
+```mermaid
+sequenceDiagram
+    participant A as User A
+    participant SA as Chat server A
+    participant R as Redis
+    participant DB as Inbox table (DB)
+    participant N as Notification service
+    participant B as User B
+    participant SC as Chat server C
+    A->>SA: send message to B
+    SA->>R: is B online?
+    R-->>SA: offline
+    SA->>R: add to B's inbox
+    SA->>DB: store in inbox table
+    SA->>N: request push
+    N->>B: push via APNs / FCM
+    Note over B: later, B opens the app
+    B->>SC: connect (WebSocket)
+    SC->>R: fetch pending inbox
+    SC->>DB: fetch any missed messages
+    SC->>B: deliver pending messages
+    SC-->>SA: delivery and read receipts, A is notified
+```
+
 1. Same first steps. Redis says B is **offline**.
 2. Add message to B's **inbox in Redis** and to the **inbox table in the DB**.
 3. **Notification service** -> **APNs/FCM push**.
@@ -768,6 +1203,25 @@ Example: user A has **3 devices** (phone, tablet, desktop), user B has **2** (ph
 5. When B comes online and connects to a chat server (e.g., C): **fetch pending from Redis inbox + any missed from DB inbox**, deliver, and notify A on read.
 
 **Group messages (50-100 members)** `[2:25:07]`
+
+```mermaid
+flowchart TB
+    A["User A sends to group 789"] --> CS["Chat server"]
+    CS --> GS["Group service<br/>returns member IDs"]
+    CS --> RC["Redis: check status of ~50 members"]
+    RC --> ON["30 online"]
+    RC --> OFF["20 offline"]
+    ON --> PS["Redis pub/sub, in parallel"]
+    PS --> SB["Chat server B: 15 users"]
+    PS --> SC["Chat server C: 15 users"]
+    SB --> WS1["WebSocket delivery + acks"]
+    SC --> WS2["WebSocket delivery + acks"]
+    OFF --> INBOX["20 inbox records (Redis + DB)"]
+    INBOX --> PUSH["Push via notification service"]
+    CS --> Q["Message queue: ONE write per message"]
+    Q --> DB[("Cassandra")]
+```
+
 1. A sends to the chat server with the group ID.
 2. Chat server asks the **group service** for the member list.
 3. Check each member's status via **Redis cache** (say 30 online, 20 offline).
@@ -780,6 +1234,30 @@ Example: user A has **3 devices** (phone, tablet, desktop), user B has **2** (ph
 **Wrong way:** upload to chat server -> store in DB -> recipient downloads from chat server. Chat servers become **bandwidth-limited** moving large blobs instead of routing messages. A server holding ~100K connections could be crushed by ~100 users uploading small files.
 
 **Right way: pre-signed URLs**
+
+```mermaid
+sequenceDiagram
+    participant A as User A app
+    participant CA as Chat server A
+    participant S3 as Blob storage (S3)
+    participant CB as Chat server B
+    participant B as User B app
+    participant CDN as CDN
+    A->>CA: request pre-signed upload URL
+    CA->>S3: generate URL
+    S3-->>CA: upload URL
+    CA-->>A: upload URL
+    A->>S3: upload file directly
+    S3-->>A: success + media URL
+    A->>CA: send chat message with media URL
+    CA->>CB: route message (small, URL only)
+    CB->>B: deliver message + media URL
+    B->>CB: request pre-signed download URL
+    CB-->>B: download URL
+    B->>CDN: download media (or directly from S3)
+    CDN-->>B: media (TTL 30 days)
+```
+
 1. A taps send -> app requests a **pre-signed upload URL** from the chat server.
 2. Chat server asks blob storage (S3) to generate it and returns it.
 3. A **uploads directly to S3**; S3 confirms and returns the media URL.
@@ -798,6 +1276,20 @@ Example: user A has **3 devices** (phone, tablet, desktop), user B has **2** (ph
 - Each instance: **Kafka consumer -> batch write to DB cluster**. **Retry** on failure. If still failing, **do not delete from the queue**, or send to a **dead letter queue (DLQ)**.
 
 **Detailed processing pipeline**
+
+```mermaid
+flowchart LR
+    Q["Kafka topic<br/>partitions assigned to instances"] --> C["Consumer<br/>batch 500, poll ~100 ms"]
+    C --> W["Thread pool, 20 workers<br/>validate schema + metadata<br/>enrich: dedup hash, mentions, links, indexes"]
+    W --> BW["Batch writer<br/>1,000 msgs or every 5 s<br/>group by conversation"]
+    BW -- "success" --> DB[("Cassandra atomic batch insert")]
+    DB --> IDX["Index updater<br/>search + analytics"]
+    IDX --> OK["Mark processed"]
+    BW -- "some messages fail" --> RT["Retry with escalating steps"]
+    RT -- "still failing" --> DLQ["Dead letter queue"]
+    DLQ --> NOTIFY["Notify user: not delivered"]
+```
+
 1. Batch size e.g. **500 messages**; consumer **polls every ~100 ms**; process with a **thread pool (e.g., 20 workers)**.
 2. Per message: **validate schema**, metadata checks (e.g., file size limit), then **validate and enrich**:
    - compute **message hash for deduplication**
@@ -817,6 +1309,23 @@ Example: user A has **3 devices** (phone, tablet, desktop), user B has **2** (ph
 ### End-to-end encryption (Signal protocol)
 
 - Messages are encrypted on the sender's device and decrypted only on the recipient's. **Servers cannot read content.**
+
+```mermaid
+sequenceDiagram
+    participant A as User A device
+    participant K as Key server
+    participant B as User B device
+    Note over A,B: At registration each user makes an identity key pair. The private key never leaves the device.
+    A->>K: upload public identity key
+    B->>K: upload public identity key + prekeys (e.g. 100)
+    A->>K: fetch B's identity key + one prekey
+    K-->>A: B's public keys
+    A->>A: key exchange gives a shared session key
+    A->>B: ciphertext (via chat servers, they cannot read it)
+    B->>B: derives the same session key and decrypts
+    Note over A,B: a message counter / ratchet changes the key for every message
+```
+
 - **Flow**
   1. Each user generates an **identity key pair** at registration. **Public key** uploaded to the **key server**; **private key never leaves the device**.
   2. User B also uploads **prekeys** (e.g., ~100 signed prekeys); the server stores them for future initiators.
@@ -840,6 +1349,18 @@ Without limits, attackers can scrape data or DDoS. Apply limits **per action typ
 
 (Numbers are examples; clarify in requirements.)
 
+```mermaid
+flowchart TD
+    ACT["User action<br/>message / group create / media / connection / invite"] --> CHK{"Token bucket has tokens?<br/>(Redis, atomic)"}
+    CHK -- "yes: deduct 1" --> OK["Allow and write to DB"]
+    CHK -- "no" --> BLK["Block: too many requests, retry in 60 s<br/>or require CAPTCHA"]
+    BLK --> P1["1st: warning"]
+    P1 --> P2["2nd: 1-hour restriction"]
+    P2 --> P3["3rd: 24-hour restriction"]
+    P3 --> P4["Account suspended, human review"]
+    P4 --> P5["Repeated abuse: permanent deletion"]
+```
+
 **Enforcement flow:** check limit -> **exceeded: block** (show "too many requests, try again in 60 s") **or require CAPTCHA** -> otherwise allow and write to DB.
 
 **Progressive penalties:** warning -> **1-hour restriction** -> **24-hour restriction** -> **account suspended for human review** (contact user; tagged suspicious) -> repeated abuse = **permanent deletion**.
@@ -862,6 +1383,18 @@ Without limits, attackers can scrape data or DDoS. Apply limits **per action typ
 - **Upside:** **blazingly fast reads**; each user reads only their own shard.
 - Add **replicas** per shard: users read from **replicas** (A reads replica A, B reads replica B), primaries handle writes.
 
+```mermaid
+flowchart LR
+    A["User A"] -- "send msg to B" --> W["Write path"]
+    W -- "copy 1" --> SA[("Shard A primary<br/>A's conversations")]
+    W -- "copy 2" --> SB[("Shard B primary<br/>B's conversations")]
+    SA -. "async replication" .-> RA[("Replica A")]
+    SB -. "async replication" .-> RB[("Replica B")]
+    RA -- "A reads own history" --> A
+    RB -- "B reads own history" --> B["User B"]
+```
+(2x write volume, but every read hits only one replica.)
+
 **Rule:** **sharding scales writes; replication scales reads.**
 
 **Replication details:** per shard, primary + e.g. **3 replicas** with **asynchronous** replication (**eventually consistent**). Read queries (opening chats, unread messages) go **only to replicas**; writes go to the **primary**.
@@ -871,6 +1404,20 @@ Without limits, attackers can scrape data or DDoS. Apply limits **per action typ
 **Cleanup jobs (garbage collection)** `[2:57:54]`
 - Clean **expired media**, **old undelivered messages**, **stale connections**.
 - **Job scheduler** (Airflow / cron; daily or weekly) -> **job queue** (separate from the message queue) -> **worker pool** (containerized executors) -> executes cleanup tasks (deletes expired media by date, removes undelivered messages that failed DB writes but linger in memory, stale connections) -> **submit results to monitoring**.
+
+```mermaid
+flowchart LR
+    S["Job scheduler<br/>Airflow / cron (daily or weekly)"] --> JQ["Job queue<br/>(separate from message queue)"]
+    JQ --> WP["Worker pool<br/>containerized executors"]
+    WP --> T1["Delete expired media"]
+    WP --> T2["Remove stale undelivered messages"]
+    WP --> T3["Close stale connections"]
+    T1 --> M["Report results to monitoring"]
+    T2 --> M
+    T3 --> M
+    WP -. "failure: requeue" .-> JQ
+```
+
 - **Trade-off:** adds operational complexity (another thing to monitor/debug), but the alternative is garbage accumulating until it forces you to do it anyway.
 
 ## 5.11 Failure handling and global scaling `[3:00:32]`
@@ -881,11 +1428,43 @@ Without limits, attackers can scrape data or DDoS. Apply limits **per action typ
 - **Read path:** try Redis; on failure, **log it** and **fall back to the DB** (slower but works). Either way the message is delivered.
 - **Recovery:** a **background job** syncs from the DB to Redis (select inbox messages where not delivered), then normal Redis flow resumes.
 
+```mermaid
+flowchart TD
+    subgraph W["Write an undelivered message"]
+        W1["Chat server"] --> W2["Redis inbox (fast)"]
+        W1 --> W3[("DB inbox (durable backup)")]
+    end
+    subgraph RD["Read pending messages"]
+        R1{"Redis available?"} -- "yes" --> R2["Read from Redis inbox"]
+        R1 -- "no: log it" --> R3["Fallback: read from DB (slower)"]
+    end
+    R3 --> REC["Redis recovers: background job syncs<br/>undelivered inbox rows from DB to Redis"]
+    REC --> R2
+```
+
 ### Regions and global distribution `[3:04:28]`
 - Each **region** (e.g., US East, Singapore, Ireland) has a **full stack**: load balancer, chat servers, Redis clusters, DB shards, so it can operate independently.
 - User in Tokyo: **DNS lookup** -> nearest region (e.g., Singapore) -> LB -> chat server (WebSocket).
 - **Redis lookup** finds where user B is so the message routes to B's region; B (e.g., London) connects to the nearest region via DNS.
 - **Capacity varies per region** (e.g., many chat servers in Ireland, fewer in Singapore).
+
+```mermaid
+flowchart LR
+    UT["User in Tokyo"] -- "1. DNS lookup" --> DNS["DNS"]
+    DNS -- "2. nearest region" --> LB1
+    subgraph SG["Singapore region (full stack)"]
+        LB1["LB"] --> CS1["Chat servers"]
+        CS1 --> R1["Redis"]
+        CS1 --> DB1[("DB shards")]
+    end
+    CS1 -- "3. Redis lookup finds B's region" --> CS2
+    subgraph LD["London region (full stack)"]
+        LB2["LB"] --> CS2["Chat servers"]
+        CS2 --> R2["Redis"]
+        CS2 --> DB2[("DB shards")]
+    end
+    CS2 --> UL["User B in London"]
+```
 
 ### Kafka failure `[3:06:37]`
 - Kafka scales well (topics split into **partitions**, each with a **leader** and **replicas**; producers write to leaders).
@@ -897,12 +1476,34 @@ Without limits, attackers can scrape data or DDoS. Apply limits **per action typ
   - If the **chat server also fails** (both down), keep an **append-only log file on local disk**; **replay** it on recovery, **delete after successful publish**.
   - **Recovery:** request messages since last ID from the storage service, query processed messages in the DB, find which are still unpublished, **republish** them, then resume normal consumption.
 
+```mermaid
+flowchart TD
+    P["Chat server publishes to Kafka"] --> OK{"Kafka reachable?"}
+    OK -- "yes" --> DONE["Published, storage service consumes"]
+    OK -- "no" --> LOG["Log the error"]
+    LOG --> BUF["Push to local in-memory buffer<br/>(max ~100,000, drop oldest if full)"]
+    BUF --> WAIT["Wait longer than the time to spin up a new Kafka, then retry"]
+    WAIT --> OK
+    BUF -. "chat server also crashes" .-> DISK["Append-only log on local disk"]
+    DISK --> REPLAY["On recovery: replay the log,<br/>delete after successful publish"]
+    REPLAY --> OK
+    WAIT --> RECON["Kafka back: query processed messages since last ID,<br/>republish the missing ones, resume normal consumption"]
+```
+
 ## 5.12 Feature flags and rollouts `[3:09:08]`
 
 - Usually you **don't release features to all users at once**; do **gradual rollout** using a **feature flag store** (LaunchDarkly, Azure/AWS native tools).
 - Flags are **key-value pairs** (e.g., `new_theme_enabled = true/false`), controlled **per environment** (true on staging, false on production).
 - **Gradual enablement:** e.g., **20% of users** get the beta feature; watch failure logs; if good, enable for everyone. Can be per user or per group.
 - The **chat server checks** the flag store and returns enabled features. It can send new-feature messages to **client versions above e.g. 2.2** and **strip unsupported fields** for older clients.
+
+```mermaid
+flowchart LR
+    CS["Chat server"] -- "which features are on?" --> FF["Feature flag store<br/>LaunchDarkly / cloud native"]
+    FF -- "flags per environment + rollout %" --> CS
+    CS --> NEW["Client version above 2.2:<br/>send message with new feature"]
+    CS --> OLD["Older client:<br/>strip unsupported fields"]
+```
 
 > **➕ Added:** Also mention **kill switches**, **canary/ring deployments**, **dark launches (shadow traffic)**, backward-compatible protocol versions (old clients live for months), and **expand/contract DB migrations**. Clean up stale flags.
 
@@ -1163,6 +1764,17 @@ Latency: search <500ms | booking 2-3s | chat <500ms | memory ns, SSD us, DB ms
 ```
 
 ## 10.6 System 1: Music streaming (one screen)
+
+```mermaid
+flowchart LR
+    C["Client"] --> LB["LB"]
+    LB --> API["Stateless API (JWT)"]
+    API --> SQL[("SQL metadata")]
+    API -- "signed URL" --> C
+    C -- "range requests" --> CDN["CDN"]
+    CDN -.-> BLOB[("Blob storage")]
+```
+
 - Client -> **LB** -> **stateless REST API (JWT)** -> **SQL** (metadata) + **blob storage** (audio, **signed URLs**, range requests for chunks).
 - Upload: validate format/size -> blob -> extract metadata -> SQL -> hierarchical key -> **CDN invalidation**.
 - Schema: users, playlists, playlist_items, songs, artists, artist_songs. **SQL because of joins.**
@@ -1170,6 +1782,17 @@ Latency: search <500ms | booking 2-3s | chat <500ms | memory ns, SSD us, DB ms
 - Insight: **audio dominates storage and bandwidth**; start simple.
 
 ## 10.7 System 2: Hotel booking (one screen)
+
+```mermaid
+flowchart LR
+    C["Client"] --> GW["API gateway"]
+    GW --> SVC["Hotel / Reservation / Rate / Payment / Notification"]
+    SVC --> PG[("PostgreSQL, shard by hotel_id")]
+    SVC --> R[("Redis, TTL 5 min")]
+    PG -- "CDC: Debezium + Kafka" --> ES[("Elasticsearch")]
+    C -- "search" --> ES
+```
+
 - Read-heavy (~1,000 QPS vs ~17 TPS). Strong consistency for booking, eventual for search.
 - Gateway -> hotel / reservation / rate / payment / notification services; **PostgreSQL** (shared DB for coupled data, local ACID); **Redis** (key = hotel+roomtype+date, TTL ~5 min); **Elasticsearch** via **CDC** (WAL -> Debezium -> Kafka); Kafka for payment/notification/availability events.
 - **Inventory:** per hotel + room type + date (`total_inventory`, `total_reserved`); overbooking factor (e.g., 10%); prepopulate 2 years + daily cron.
@@ -1179,6 +1802,18 @@ Latency: search <500ms | booking 2-3s | chat <500ms | memory ns, SSD us, DB ms
 - **Replication:** primary + regional replicas; recent write -> primary; geo-latency LB; regional Redis/ES; **single primary** to avoid write conflicts.
 
 ## 10.8 System 3: WhatsApp-style chat (one screen)
+
+```mermaid
+flowchart LR
+    C["Client"] <-- "WebSocket" --> CS["Chat servers behind L4 LB"]
+    CS <--> R[("Redis: connections, inbox, pub/sub")]
+    CS --> K["Kafka"]
+    K --> ST["Storage service"]
+    ST --> CA[("Cassandra")]
+    CS --> N["Notification: APNs / FCM"]
+    C -- "pre-signed URL" --> S3[("Blob + CDN")]
+```
+
 - Client <-> **L4 LB** <-> **chat servers (WebSocket)**; **Redis** connection cache + pub/sub routing; **Kafka** -> message storage -> **Cassandra/DynamoDB**; **blob + CDN** for media (**pre-signed URLs**); **APNs/FCM** for offline; presence service (heartbeats).
 - Flow: generate timestamp-based message ID -> ack **sent** -> queue -> route (Redis lookup) -> **delivered** -> **read**.
 - Offline: inbox in **Redis + DB** -> push -> fetch on reconnect.
@@ -1193,6 +1828,21 @@ Latency: search <500ms | booking 2-3s | chat <500ms | memory ns, SSD us, DB ms
 - **Feature flags:** per-env flags, 20% gradual rollout, strip fields for old clients.
 
 ## 10.9 Decision rules ("if X then Y")
+
+```mermaid
+flowchart TD
+    Q["What does the requirement need?"] --> M{"Money / inventory correctness?"}
+    M -- "yes" --> SQL["SQL + ACID + row locks + idempotency key"]
+    M -- "no" --> W{"Huge write volume, simple queries?"}
+    W -- "yes" --> NOSQL["Cassandra / DynamoDB"]
+    W -- "no" --> S{"Fuzzy / geo / filter search?"}
+    S -- "yes" --> ES["Elasticsearch fed by CDC"]
+    S -- "no" --> F{"Large files?"}
+    F -- "yes" --> BLOB["Blob storage + pre-signed URLs + CDN"]
+    F -- "no" --> RT{"Real-time push?"}
+    RT -- "yes" --> WS["WebSocket + L4 LB"]
+    RT -- "no" --> REST["REST + cache + replicas"]
+```
 
 | If you need... | Use... |
 |---|---|
